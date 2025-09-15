@@ -1,0 +1,11 @@
+# core
+haystack-ai
+fastapi
+uvicorn[standard]
+python-multipart
+python-dotenv
+
+# helpers
+pypdf
+sentence-transformers
+openai
