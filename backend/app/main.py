@@ -6,6 +6,9 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 from pydantic import BaseModel
 from typing import Optional, List
 
+from dotenv import load_dotenv
+load_dotenv()
+
 from haystack import Document, Pipeline
 from haystack.document_stores.in_memory import InMemoryDocumentStore
 from haystack.components.embedders import SentenceTransformersDocumentEmbedder, SentenceTransformersTextEmbedder
@@ -23,43 +26,59 @@ app = FastAPI(title="RAG Chatbot API")
 # Global containers
 DOCUMENT_STORE = None
 DOC_EMBEDDER = None
-TEXT_EMBEDDER = None
-RETRIEVER = None
+
+# Separate embedders/retrievers for two pipelines (avoid sharing instances)
+TEXT_EMBEDDER_RET = None
+TEXT_EMBEDDER_RAG = None
+RETRIEVER_RET = None
+RETRIEVER_RAG = None
+
 RAG_PIPELINE = None
 RETRIEVAL_PIPELINE = None
 CHAT_GENERATOR = None
 
+from openai import OpenAI
+
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")  # change as needed
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-3.5-turbo-0125")  # change as needed
 
 @app.on_event("startup")
 def startup_event():
-    global DOCUMENT_STORE, DOC_EMBEDDER, TEXT_EMBEDDER, RETRIEVER, RAG_PIPELINE, RETRIEVAL_PIPELINE, CHAT_GENERATOR
+    global DOCUMENT_STORE, DOC_EMBEDDER
+    global TEXT_EMBEDDER_RET, TEXT_EMBEDDER_RAG
+    global RETRIEVER_RET, RETRIEVER_RAG
+    global RAG_PIPELINE, RETRIEVAL_PIPELINE, CHAT_GENERATOR
 
-    # 1) Document store
+    # 1) Document store (single store is fine)
     DOCUMENT_STORE = InMemoryDocumentStore()
 
-    # 2) Document embedder (creates embeddings for documents)
+    # 2) Document embedder (used for indexing documents) — single instance OK
     DOC_EMBEDDER = SentenceTransformersDocumentEmbedder(model="sentence-transformers/all-MiniLM-L6-v2")
     DOC_EMBEDDER.warm_up()
 
-    # 3) Text embedder (for queries)
-    TEXT_EMBEDDER = SentenceTransformersTextEmbedder(model="sentence-transformers/all-MiniLM-L6-v2")
-    TEXT_EMBEDDER.warm_up()
+    # 3) Create separate text embedders for each pipeline
+    TEXT_EMBEDDER_RET = SentenceTransformersTextEmbedder(model="sentence-transformers/all-MiniLM-L6-v2")
+    TEXT_EMBEDDER_RET.warm_up()
 
-    # 4) Retriever
-    RETRIEVER = InMemoryEmbeddingRetriever(document_store=DOCUMENT_STORE)
+    TEXT_EMBEDDER_RAG = SentenceTransformersTextEmbedder(model="sentence-transformers/all-MiniLM-L6-v2")
+    TEXT_EMBEDDER_RAG.warm_up()
+
+    # 4) Create two retrievers (they can share DOCUMENT_STORE)
+    RETRIEVER_RET = InMemoryEmbeddingRetriever(document_store=DOCUMENT_STORE)
+    RETRIEVER_RAG = InMemoryEmbeddingRetriever(document_store=DOCUMENT_STORE)
 
     # 5) Optional: Chat generator (requires OPENAI_API_KEY)
     if OPENAI_API_KEY:
         os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
         CHAT_GENERATOR = OpenAIChatGenerator(model=OPENAI_MODEL)
+    else:
+        CHAT_GENERATOR = None
 
-    # 6) Prompt builder: small template
+    # 6) Prompt builder: small template — set required_variables
     template = [
         ChatMessage.from_user(
             """
-            Given the following context, answer the user's question as accurately and concisely as possible.
+            You are an AI assistant of "ucc.co.ug". Given the following context, answer the user's question as accurately and concisely as possible. when user greet or initiate the conversation, you have to greet that user properly. When you couldn't find the asked data, then you have to say "I'm sorry. I  couldn't find the relevant information." 
 
             Context:
             {% for document in documents %}
@@ -71,20 +90,19 @@ def startup_event():
             """
         )
     ]
-    prompt_builder = ChatPromptBuilder(template=template)
+    prompt_builder = ChatPromptBuilder(template=template, required_variables=["question", "documents"])
 
-    # 7) Build two pipelines:
-    # A) Retrieval-only pipeline (text_embedder -> retriever)
+    # 7) Build retrieval-only pipeline (text_embedder -> retriever)
     RETRIEVAL_PIPELINE = Pipeline()
-    RETRIEVAL_PIPELINE.add_component("text_embedder", TEXT_EMBEDDER)
-    RETRIEVAL_PIPELINE.add_component("retriever", RETRIEVER)
+    RETRIEVAL_PIPELINE.add_component("text_embedder", TEXT_EMBEDDER_RET)
+    RETRIEVAL_PIPELINE.add_component("retriever", RETRIEVER_RET)
     RETRIEVAL_PIPELINE.connect("text_embedder.embedding", "retriever.query_embedding")
 
-    # B) RAG pipeline (text_embedder -> retriever -> prompt_builder -> llm)
+    # 8) Build RAG pipeline (separate instances)
     if CHAT_GENERATOR:
         RAG_PIPELINE = Pipeline()
-        RAG_PIPELINE.add_component("text_embedder", TEXT_EMBEDDER)
-        RAG_PIPELINE.add_component("retriever", RETRIEVER)
+        RAG_PIPELINE.add_component("text_embedder", TEXT_EMBEDDER_RAG)
+        RAG_PIPELINE.add_component("retriever", RETRIEVER_RAG)
         RAG_PIPELINE.add_component("prompt_builder", prompt_builder)
         RAG_PIPELINE.add_component("llm", CHAT_GENERATOR)
         RAG_PIPELINE.connect("text_embedder.embedding", "retriever.query_embedding")
@@ -92,6 +110,16 @@ def startup_event():
         RAG_PIPELINE.connect("prompt_builder.prompt", "llm.messages")
     else:
         RAG_PIPELINE = None
+
+    print("Startup complete: pipelines ready.")
+
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+    models = client.models.list()
+
+    for m in models.data:
+     print(m.id)
+
 
 class QueryRequest(BaseModel):
     query: str
@@ -139,6 +167,7 @@ async def query(req: QueryRequest):
     top_k = req.top_k or 5
 
     if RAG_PIPELINE:
+        print("OpenAI Key found")
         payload = {"text_embedder": {"text": question}, "prompt_builder": {"question": question}}
         resp = RAG_PIPELINE.run(payload)
         # The exact shape: resp["llm"]["replies"][0].text
@@ -150,6 +179,7 @@ async def query(req: QueryRequest):
         return {"answer": answer, "retrieved": [{"content": d.content, "meta": d.meta} for d in retrieved]}
     else:
         # retrieval-only
+        print("OpenAI Key Nottt found")
         resp = RETRIEVAL_PIPELINE.run({"text_embedder": {"text": question}})
         retrieved = resp.get("retriever", {}).get("documents", [])
         snippets = [{"content": d.content, "meta": d.meta} for d in retrieved[:top_k]]
