@@ -1,5 +1,5 @@
 # core
-haystack-ai
+farm-haystack
 fastapi
 uvicorn[standard]
 python-multipart

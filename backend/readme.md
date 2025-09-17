@@ -9,7 +9,6 @@ python -m venv .venv
 pip install -r requirements.txt
 
 
-export OPENAI_API_KEY="sk-..."   # optional, only if you want LLM answers
 uvicorn app.main:app --reload --port 8000
 
 curl -X POST "http://localhost:8000/ingest" -F "file=@/path/to/your.pdf;type=application/pdf"
