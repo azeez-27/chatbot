@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, useState } from "react";
+import { v4 as uuidv4 } from "uuid";
 import "./chat-widget.css";
 
 /**
@@ -11,11 +12,13 @@ import "./chat-widget.css";
  * - placeholder (string)
  */
 function uid(prefix = "id") {
-  return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+  return `${prefix}_${Date.now().toString(36)}_${Math.random()
+    .toString(36)
+    .slice(2, 8)}`;
 }
 
 export default function ChatWidget({
-  apiUrl = "/api/chat",
+  apiUrl = "http://127.0.0.1:8000/query",
   authToken = null,
   initialMessages = [],
   headerTitle = "Chat",
@@ -34,6 +37,8 @@ export default function ChatWidget({
   const [error, setError] = useState(null);
   const containerRef = useRef(null);
   const controllerRef = useRef(null);
+  const [sessionId, setSessionId] = useState("");
+  const [isTyping, setIsTyping] = useState(false);
 
   useEffect(() => {
     const el = containerRef.current;
@@ -47,6 +52,12 @@ export default function ChatWidget({
     };
   }, []);
 
+  useEffect(() => {
+    const id = uuidv4();
+    setSessionId(id);
+    console.log("Session ID:", id);
+  }, []);
+
   function pushMessage(msg) {
     setMessages((prev) => {
       const next = [...prev, msg].slice(-maxMessages);
@@ -55,13 +66,16 @@ export default function ChatWidget({
   }
 
   function updateMessage(id, patch) {
-    setMessages((prev) => prev.map((m) => (m.id === id ? { ...m, ...patch } : m)));
+    setMessages((prev) =>
+      prev.map((m) => (m.id === id ? { ...m, ...patch } : m))
+    );
   }
 
-  function formatOutgoing(userText, history) {
+  function formatOutgoing(userText) {
     return {
-      message: userText,
-      history: history.map((h) => ({ role: h.role, text: h.text, id: h.id, createdAt: h.createdAt })),
+      query: userText,
+      sessionId: sessionId,
+      // history: history.map((h) => ({ role: h.role, text: h.text, id: h.id, createdAt: h.createdAt })),
     };
   }
 
@@ -79,22 +93,24 @@ export default function ChatWidget({
     pushMessage(userMsg);
     setText("");
 
-    const botMsg = {
-      id: uid("b"),
+    // This is the bot's temporary message bubble for the typing indicator
+    const typingMsg = {
+      id: uid("typing"),
       role: "assistant",
-      text: "",
-      streaming: true,
+      text: "...", // Or you can use an SVG or animated GIF in a separate component
+      isTypingIndicator: true, // A flag to identify this message
       createdAt: new Date().toISOString(),
     };
-    pushMessage(botMsg);
+    pushMessage(typingMsg);
 
     setIsSending(true);
 
     const controller = new AbortController();
+
     controllerRef.current = controller;
 
     try {
-      const outgoing = formatOutgoing(trimmed, messages.concat(userMsg));
+      const outgoing = formatOutgoing(trimmed);
       const headers = { "Content-Type": "application/json" };
       if (authToken) headers["Authorization"] = `Bearer ${authToken}`;
 
@@ -110,31 +126,31 @@ export default function ChatWidget({
         throw new Error(`Server ${res.status}: ${textErr}`);
       }
 
-      // streaming support (if backend streams)
-      if (res.body && typeof res.body.getReader === "function") {
-        const reader = res.body.getReader();
-        const decoder = new TextDecoder();
-        let done = false;
-        let accumulated = "";
+      const data = await res.json();
+      const reply = data?.answer ?? JSON.stringify(data);
 
-        while (!done) {
-          const { value, done: d } = await reader.read();
-          done = d;
-          if (value) {
-            const chunk = decoder.decode(value, { stream: !done });
-            accumulated += chunk;
-            updateMessage(botMsg.id, { text: accumulated });
-          }
-        }
-        updateMessage(botMsg.id, { streaming: false });
-      } else {
-        const data = await res.json();
-        const reply = data?.reply ?? data?.message ?? JSON.stringify(data);
-        updateMessage(botMsg.id, { text: String(reply), streaming: false });
-      }
+      // Remove the typing indicator message before adding the real reply
+      setMessages((prev) => prev.filter((m) => m.id !== typingMsg.id));
+
+      const botMsg = {
+        id: uid("b"),
+        role: "assistant",
+        text: String(reply),
+        createdAt: new Date().toISOString(),
+      };
+      pushMessage(botMsg);
     } catch (err) {
+      // Also remove the typing indicator on error
+      setMessages((prev) => prev.filter((m) => m.id !== "typing"));
       const message = err?.message ?? String(err);
-      updateMessage(botMsg.id, { text: `Error: ${message}`, streaming: false, error: true });
+      const errorMsg = {
+        id: uid("error"),
+        role: "assistant",
+        text: `Error: ${message}`,
+        error: true,
+        createdAt: new Date().toISOString(),
+      };
+      pushMessage(errorMsg);
       setError(message);
       if (typeof onError === "function") onError(err);
     } finally {
@@ -158,7 +174,12 @@ export default function ChatWidget({
   }
 
   function retryLast() {
-    const lastAssistant = [...messages].reverse().find((m) => m.role === "assistant" && (m.error || !m.text || m.text.length < 1));
+    const lastAssistant = [...messages]
+      .reverse()
+      .find(
+        (m) =>
+          m.role === "assistant" && (m.error || !m.text || m.text.length < 1)
+      );
     if (!lastAssistant) return;
     const idx = messages.findIndex((m) => m.id === lastAssistant.id);
     const prev = messages[idx - 1];
@@ -174,8 +195,19 @@ export default function ChatWidget({
         <div className="chat-widget-header">
           <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
             <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-              <svg className="chat-icon" viewBox="0 0 24 24" width="22" height="22" fill="none" xmlns="http://www.w3.org/2000/svg">
-                <path d="M12 2a10 10 0 100 20 10 10 0 000-20z" stroke="currentColor" strokeWidth="1.2" />
+              <svg
+                className="chat-icon"
+                viewBox="0 0 24 24"
+                width="22"
+                height="22"
+                fill="none"
+                xmlns="http://www.w3.org/2000/svg"
+              >
+                <path
+                  d="M12 2a10 10 0 100 20 10 10 0 000-20z"
+                  stroke="currentColor"
+                  strokeWidth="1.2"
+                />
               </svg>
             </div>
             <div>
@@ -184,20 +216,39 @@ export default function ChatWidget({
           </div>
 
           <div style={{ display: "flex", gap: 8 }}>
-            <button className="icon-btn" onClick={() => setVisible((v) => !v)} aria-label={visible ? "Minimize chat" : "Open chat"}>
+            <button
+              className="icon-btn"
+              onClick={() => setVisible((v) => !v)}
+              aria-label={visible ? "Minimize chat" : "Open chat"}
+            >
               {visible ? "—" : "+"}
             </button>
-            <button className="icon-btn" onClick={clearChat} aria-label="Clear chat">🗑</button>
+            <button
+              className="icon-btn"
+              onClick={clearChat}
+              aria-label="Clear chat"
+            >
+              🗑
+            </button>
           </div>
         </div>
 
         {visible && (
           <div className="chat-widget-body" role="log" aria-live="polite">
             <div ref={containerRef} className="chat-widget-messages">
-              {messages.length === 0 && <div className="chat-empty">Say hello 👋 — ask about your product, docs, or anything.</div>}
+              {messages.length === 0 && (
+                <div className="chat-empty">
+                  Say hello 👋 — ask about your product, docs, or anything.
+                </div>
+              )}
 
               {messages.map((msg) => (
-                <div key={msg.id} className={`msg-row ${msg.role === "user" ? "msg-user" : "msg-assistant"}`}>
+                <div
+                  key={msg.id}
+                  className={`msg-row ${
+                    msg.role === "user" ? "msg-user" : "msg-assistant"
+                  }`}
+                >
                   <div className="msg-bubble-wrapper">
                     {showAvatar && (
                       <div className="avatar">
@@ -205,11 +256,22 @@ export default function ChatWidget({
                       </div>
                     )}
                     <div>
-                      <div className="msg-bubble">{msg.text}</div>
-                      <div className="msg-meta">{new Date(msg.createdAt).toLocaleString()}</div>
+                      <div className="msg-bubble">
+                        {msg.isTypingIndicator ? (
+                          <span className="typing-indicator">...</span>
+                        ) : (
+                          msg.text
+                        )}
+                      </div>
+                      <div className="msg-meta">
+                        {new Date(msg.createdAt).toLocaleString()}
+                      </div>
                       {msg.error && (
                         <div className="msg-error">
-                          There was an error. <button onClick={retryLast} className="link-btn">Retry</button>
+                          There was an error.{" "}
+                          <button onClick={retryLast} className="link-btn">
+                            Retry
+                          </button>
                         </div>
                       )}
                     </div>
@@ -235,7 +297,11 @@ export default function ChatWidget({
                   aria-label="Type your message"
                 />
                 <div>
-                  <button type="submit" className="chat-send-btn" disabled={isSending}>
+                  <button
+                    type="submit"
+                    className="chat-send-btn"
+                    disabled={isSending}
+                  >
                     {isSending ? "Sending..." : "Send"}
                   </button>
                 </div>
