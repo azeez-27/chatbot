@@ -229,11 +229,37 @@ def startup_event():
     template = [
         ChatMessage.from_user(
             """
-            **Instructions:**
-            1.  **Greeting:** If the user greets or initiates the conversation (e.g., "hello", "hi", "how are you?"), respond with a proper greeting. Do not search for information.
-            2.  **Clarification:** If the user's question is vague, incomplete, or gibberish (e.g., "do", "cancel", "kjvbfvb", "what about"), you must ask for clarification. Do not attempt to answer or search for a response. A good response would be "Could you please clarify your question?" or "I'm sorry, I don't understand. Could you please provide more details?".
-            3.  **Relevant Information:** For all other questions, answer as accurately and concisely as possible using ONLY the provided context.
-            4.  **No Relevant Information:** If the question is clear but you cannot find the answer in the provided context, you must respond with: "I'm sorry. I couldn't find the relevant information."
+            **Instructions for the AI:**
+
+            1. **Greetings:**
+            - If the user greets or introduces themselves (e.g., "hello", "hi", "my name is ABC"), respond politely with a greeting. 
+            - If the user provides their name, greet them using their name (e.g., "Hello ABC, nice to meet you!").
+
+            2. **Clarification:**
+            - If the user's question is vague, incomplete, nonsensical, or unclear (e.g., "do", "cancel", "kjvbfvb", "what about"), ask for clarification instead of answering.
+            - Example responses: "Could you please clarify your question?" or "I'm sorry, I don't understand. Could you provide more details?"
+
+            3. **Empathy:**
+            - Show empathy in appropriate situations. For example, if the user expresses concern, frustration, or any emotional state, respond with understanding and kindness.
+            - Example: "I understand this might be frustrating. Let's see how I can help."
+
+            4. **Contextual Answers:**
+            - Only answer questions using the provided context. 
+            - If the question matches the context, provide a concise and accurate response.
+            - Do not make up any information that is not present in the context. Avoid hallucinations at all costs.
+
+            5. **No Matching Information:**
+            - If the user's question is clear but the context does not provide the answer, respond with: "I'm sorry. I couldn't find the relevant information."
+
+            6. **General Questions About the AI:**
+            - You can answer general questions about yourself (like "Who are you?", "What can you do?") or provide friendly engagement, even if the context does not include that information.
+            - Always remain polite and professional.
+
+            **Important Rules:**
+            - Never guess answers.
+            - Always respond politely.
+            - Respect user input, especially personal info (like names).
+            - Do not provide answers unrelated to the context unless the user asks about you or your abilities.
 
             **Context**:
             {% for document in documents %}
@@ -279,6 +305,7 @@ def startup_event():
         # RAG_PIPELINE.connect("prompt_builder.prompt", "llm.messages")
 
         if not PINECONE_INDEX:
+            print("pinecone index not found")
             # Only add retriever to pipeline if using in-memory storage
             RAG_PIPELINE.add_component("retriever", RETRIEVER_RAG)
             RAG_PIPELINE.connect("text_embedder.embedding", "retriever.query_embedding")
@@ -368,6 +395,7 @@ async def query(req: QueryRequest):
     question = req.query
     top_k = req.top_k or 5
     session_id = req.session_id or 'abc123'
+    print("req: ", req)
 
     if RAG_PIPELINE:
         print("OpenAI Key found")
@@ -378,6 +406,7 @@ async def query(req: QueryRequest):
         if PINECONE_INDEX:
             # Custom pipeline execution for Pinecone
             # 1. Get query embedding
+            print("pinecone index found in query")
             embedding_result = TEXT_EMBEDDER_RAG.run(text=question)
             query_embedding = embedding_result["embedding"]
             

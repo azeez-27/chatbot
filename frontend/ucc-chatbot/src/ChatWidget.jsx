@@ -18,7 +18,8 @@ function uid(prefix = "id") {
 }
 
 export default function ChatWidget({
-  apiUrl = "https://9c028ce5410f.ngrok-free.app/query",
+  // apiUrl = "https://9c028ce5410f.ngrok-free.app/query",
+  apiUrl = import.meta.env.VITE_API_URL, //"https://9c028ce5410f.ngrok-free.app/query",//"http://localhost:8000/query",
   authToken = null,
   initialMessages = [],
   headerTitle = "Chat",
@@ -74,7 +75,7 @@ export default function ChatWidget({
   function formatOutgoing(userText) {
     return {
       query: userText,
-      sessionId: sessionId,
+      session_id: sessionId,
       // history: history.map((h) => ({ role: h.role, text: h.text, id: h.id, createdAt: h.createdAt })),
     };
   }
@@ -113,7 +114,8 @@ export default function ChatWidget({
       const outgoing = formatOutgoing(trimmed);
       const headers = { "Content-Type": "application/json" };
       if (authToken) headers["Authorization"] = `Bearer ${authToken}`;
-
+      console.log("Sending msg to backend: ", outgoing);
+      
       const res = await fetch(apiUrl, {
         method: "POST",
         headers,
