@@ -18,7 +18,7 @@ function uid(prefix = "id") {
 }
 
 export default function ChatWidget({
-  apiUrl = "https://chatbot-esiv.onrender.com/query",
+  apiUrl = "https://9c028ce5410f.ngrok-free.app/query",
   authToken = null,
   initialMessages = [],
   headerTitle = "Chat",
