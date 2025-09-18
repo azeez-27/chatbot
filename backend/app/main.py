@@ -15,12 +15,9 @@ from haystack.components.embedders import SentenceTransformersDocumentEmbedder, 
 from haystack.components.retrievers.in_memory import InMemoryEmbeddingRetriever
 from haystack.components.builders import ChatPromptBuilder
 from haystack.dataclasses import ChatMessage
-from haystack.document_stores.pinecone import PineconeDocumentStore
-from pinecone import Pinecone
 
 # Optional OpenAI generator
 from haystack.components.generators.chat import OpenAIChatGenerator
-from haystack.components.retrievers.pinecone import PineconeEmbeddingRetriever
 
 from .ingest_utils import pdf_to_text, chunk_text, docs_from_text_chunks
 
@@ -48,11 +45,6 @@ from openai import OpenAI
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")  # change as needed
 
-# Read Pinecone config from env
-PINECONE_API_KEY = os.environ.get("PINECONE_API_KEY")
-PINECONE_ENVIRONMENT = os.environ.get("PINECONE_ENVIRONMENT")
-PINECONE_INDEX_NAME = os.environ.get("PINECONE_INDEX_NAME", "ucc-chatbot")
-
 OPENAI_CLIENT: OpenAI | None = None
 
 @app.on_event("startup")
@@ -70,31 +62,7 @@ def startup_event():
         OPENAI_CLIENT = None
 
     # 1) Document store (single store is fine)
-    # DOCUMENT_STORE = InMemoryDocumentStore()
-
-    # 1) Document store (Pinecone persistent vector DB)
-    if not PINECONE_API_KEY:
-        raise RuntimeError("PINECONE_API_KEY not set in environment")
-
-    # init pinecone low-level client (optional for direct mgmt)
-    pc = Pinecone(api_key=PINECONE_API_KEY)
-
-    # ensure index exists
-    if PINECONE_INDEX_NAME not in [idx["name"] for idx in pc.list_indexes()]:
-        pc.create_index(
-            name=PINECONE_INDEX_NAME,
-            dimension=384,   # embedding size of all-MiniLM-L6-v2
-            metric="cosine"
-        )
-
-    # hook into Haystack’s PineconeDocumentStore
-    DOCUMENT_STORE = PineconeDocumentStore(
-        api_key=PINECONE_API_KEY,
-        environment=PINECONE_ENVIRONMENT,
-        index=PINECONE_INDEX_NAME,
-        similarity="cosine",
-        embedding_dim=384
-    )
+    DOCUMENT_STORE = InMemoryDocumentStore()
 
     # 2) Document embedder (used for indexing documents) — single instance OK
     DOC_EMBEDDER = SentenceTransformersDocumentEmbedder(model="sentence-transformers/all-MiniLM-L6-v2")
@@ -108,8 +76,8 @@ def startup_event():
     TEXT_EMBEDDER_RAG.warm_up()
 
     # 4) Create two retrievers (they can share DOCUMENT_STORE)
-    RETRIEVER_RET = PineconeEmbeddingRetriever(document_store=DOCUMENT_STORE)
-    RETRIEVER_RAG = PineconeEmbeddingRetriever(document_store=DOCUMENT_STORE)
+    RETRIEVER_RET = InMemoryEmbeddingRetriever(document_store=DOCUMENT_STORE)
+    RETRIEVER_RAG = InMemoryEmbeddingRetriever(document_store=DOCUMENT_STORE)
 
     # 5) Optional: Chat generator (requires OPENAI_API_KEY)
     if OPENAI_API_KEY:
@@ -249,7 +217,7 @@ async def query(req: QueryRequest):
         except Exception:
             answer = None
         retrieved = resp.get("retriever", {}).get("documents", [])
-
+        
         # Persist the current user and assistant messages into session history
         add_to_history(session_id, "user", question)
         if answer:
