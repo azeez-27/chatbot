@@ -9,4 +9,4 @@ python-dotenv
 pypdf
 sentence-transformers
 openai
-pinecone-client
+pinecone
