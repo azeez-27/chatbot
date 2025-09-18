@@ -3,6 +3,7 @@ import os
 import shutil
 import tempfile
 from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List
 
@@ -22,6 +23,21 @@ from haystack.components.generators.chat import OpenAIChatGenerator
 from .ingest_utils import pdf_to_text, chunk_text, docs_from_text_chunks
 
 app = FastAPI(title="RAG Chatbot API")
+
+origins = [
+    "http://localhost",
+    "http://localhost:5173",
+    "http://127.0.0.1",
+    "http://127.0.0.1:5173"
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],  # Allows all HTTP methods (GET, POST, etc.)
+    allow_headers=["*"],  # Allows all headers
+)
 
 # Global containers
 DOCUMENT_STORE = None
@@ -90,20 +106,24 @@ def startup_event():
     template = [
         ChatMessage.from_user(
             """
-            You are an AI assistant of "ucc.co.ug". Given the following context, answer the user's question as accurately and concisely as possible. when user greet or initiate the conversation, you have to greet that user properly. When you couldn't find the asked data, then you have to say "I'm sorry. I  couldn't find the relevant information." 
+            **Instructions:**
+            1.  **Greeting:** If the user greets or initiates the conversation (e.g., "hello", "hi", "how are you?"), respond with a proper greeting. Do not search for information.
+            2.  **Clarification:** If the user's question is vague, incomplete, or gibberish (e.g., "do", "cancel", "kjvbfvb", "what about"), you must ask for clarification. Do not attempt to answer or search for a response. A good response would be "Could you please clarify your question?" or "I'm sorry, I don't understand. Could you please provide more details?".
+            3.  **Relevant Information:** For all other questions, answer as accurately and concisely as possible using ONLY the provided context.
+            4.  **No Relevant Information:** If the question is clear but you cannot find the answer in the provided context, you must respond with: "I'm sorry. I couldn't find the relevant information."
 
-            Context:
+            **Context**:
             {% for document in documents %}
             {{ document.content }}
             {% endfor %}
 
-            Conversation history (most recent last):
+            **Conversation history (most recent last):**
             {% for msg in history %}
             {{ msg.role }}: {{ msg.content }}
             {% endfor %}
 
-            Question: {{ question }}
-            Answer:
+            **Question:** {{ question }}
+            **Answer:**
             """
         )
     ]
