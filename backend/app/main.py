@@ -20,6 +20,10 @@ from haystack.dataclasses import ChatMessage
 # Optional OpenAI generator
 from haystack.components.generators.chat import OpenAIChatGenerator
 
+# Pinecone imports
+from pinecone import Pinecone, ServerlessSpec
+import numpy as np
+
 from .ingest_utils import pdf_to_text, chunk_text, docs_from_text_chunks
 
 app = FastAPI(title="RAG Chatbot API")
@@ -53,6 +57,10 @@ RAG_PIPELINE = None
 RETRIEVAL_PIPELINE = None
 CHAT_GENERATOR = None
 
+# Pinecone globals
+PINECONE_CLIENT = None
+PINECONE_INDEX = None
+
 # simple in-memory store: { session_id: [ {"role":"user","content":...}, {"role":"assistant","content":...}, ... ] }
 CONVERSATIONS: dict = {}
 
@@ -61,7 +69,79 @@ from openai import OpenAI
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")  # change as needed
 
+# Pinecone configuration
+PINECONE_API_KEY = os.environ.get("PINECONE_API_KEY")
+PINECONE_INDEX_NAME = os.environ.get("PINECONE_INDEX_NAME", "ucc-chatbot")
+PINECONE_ENVIRONMENT = os.environ.get("PINECONE_ENVIRONMENT", "us-east-1")
+
+
 OPENAI_CLIENT: OpenAI | None = None
+
+class PineconeRetriever:
+    """Custom retriever that mimics Haystack's InMemoryEmbeddingRetriever interface"""
+    
+    def __init__(self, pinecone_index, top_k: int = 5):
+        self.pinecone_index = pinecone_index
+        self.top_k = top_k
+    
+    def retrieve(self, query_embedding: List[float], top_k: Optional[int] = None) -> List[Document]:
+        """Run retrieval and return documents in Haystack format"""
+        k = top_k or self.top_k
+        
+        try:
+            # Query Pinecone
+            results = self.pinecone_index.query(
+                vector=query_embedding,
+                top_k=k,
+                include_metadata=True
+            )
+            
+            # Convert to Haystack Document format
+            documents = []
+            for match in results.matches:
+                # Reconstruct document from metadata
+                doc = Document(
+                    content=match.metadata.get('content', ''),
+                    meta={
+                        'source': match.metadata.get('source', ''),
+                        'score': match.score,
+                        'id': match.id
+                    }
+                )
+                documents.append(doc)
+            
+            return documents
+            
+        except Exception as e:
+            print(f"Error retrieving from Pinecone: {e}")
+            return {"documents": []}
+
+def store_in_pinecone(documents: List[Document]):
+    """Store documents in Pinecone with embeddings"""
+    if not PINECONE_INDEX or not documents:
+        return
+    
+    try:
+        vectors = []
+        for i, doc in enumerate(documents):
+            if hasattr(doc, 'embedding') and doc.embedding:
+                vector_data = {
+                    'id': f"doc_{hash(doc.content)}_{i}",
+                    'values': doc.embedding,
+                    'metadata': {
+                        'content': doc.content,
+                        'source': doc.meta.get('source', '') if doc.meta else ''
+                    }
+                }
+                vectors.append(vector_data)
+        
+        if vectors:
+            # Batch upsert to Pinecone
+            PINECONE_INDEX.upsert(vectors=vectors)
+            print(f"Stored {len(vectors)} documents in Pinecone")
+            
+    except Exception as e:
+        print(f"Error storing in Pinecone: {e}")
 
 @app.on_event("startup")
 def startup_event():
@@ -70,12 +150,44 @@ def startup_event():
     global TEXT_EMBEDDER_RET, TEXT_EMBEDDER_RAG
     global RETRIEVER_RET, RETRIEVER_RAG
     global RAG_PIPELINE, RETRIEVAL_PIPELINE, CHAT_GENERATOR
+    global PINECONE_INDEX, PINECONE_CLIENT
 
     if OPENAI_API_KEY:
         # instantiate the new SDK client; it accepts api_key param or will use env var
         OPENAI_CLIENT = OpenAI(api_key=OPENAI_API_KEY)
     else:
         OPENAI_CLIENT = None
+
+    # Initialize Pinecone
+    if PINECONE_API_KEY:
+        try:
+            PINECONE_CLIENT = Pinecone(api_key=PINECONE_API_KEY)
+            
+            # Get or create index
+            existing_indexes = [idx.name for idx in PINECONE_CLIENT.list_indexes()]
+            
+            if PINECONE_INDEX_NAME not in existing_indexes:
+                # Create index with 384 dimensions for sentence-transformers/all-MiniLM-L6-v2
+                PINECONE_CLIENT.create_index(
+                    name=PINECONE_INDEX_NAME,
+                    dimension=384,  # all-MiniLM-L6-v2 embedding dimension
+                    metric="cosine",
+                    spec=ServerlessSpec(
+                    cloud="aws",
+                    region=PINECONE_ENVIRONMENT
+       )
+                )
+                print(f"Created Pinecone index: {PINECONE_INDEX_NAME}")
+            
+            PINECONE_INDEX = PINECONE_CLIENT.Index(PINECONE_INDEX_NAME)
+            print(f"Connected to Pinecone index: {PINECONE_INDEX_NAME}")
+            
+        except Exception as e:
+            print(f"Error initializing Pinecone: {e}")
+            PINECONE_CLIENT = None
+            PINECONE_INDEX = None
+    else:
+        print("No Pinecone API key found, using in-memory storage only")  
 
     # 1) Document store (single store is fine)
     DOCUMENT_STORE = InMemoryDocumentStore()
@@ -92,8 +204,18 @@ def startup_event():
     TEXT_EMBEDDER_RAG.warm_up()
 
     # 4) Create two retrievers (they can share DOCUMENT_STORE)
-    RETRIEVER_RET = InMemoryEmbeddingRetriever(document_store=DOCUMENT_STORE)
-    RETRIEVER_RAG = InMemoryEmbeddingRetriever(document_store=DOCUMENT_STORE)
+    # RETRIEVER_RET = InMemoryEmbeddingRetriever(document_store=DOCUMENT_STORE)
+    # RETRIEVER_RAG = InMemoryEmbeddingRetriever(document_store=DOCUMENT_STORE)
+
+     # 4) Create retrievers - use Pinecone if available, otherwise in-memory
+    if PINECONE_INDEX:
+        RETRIEVER_RET = PineconeRetriever(PINECONE_INDEX)
+        RETRIEVER_RAG = PineconeRetriever(PINECONE_INDEX)
+        print("Using Pinecone retrievers")
+    else:
+        RETRIEVER_RET = InMemoryEmbeddingRetriever(document_store=DOCUMENT_STORE)
+        RETRIEVER_RAG = InMemoryEmbeddingRetriever(document_store=DOCUMENT_STORE)
+        print("Using in-memory retrievers")
 
     # 5) Optional: Chat generator (requires OPENAI_API_KEY)
     if OPENAI_API_KEY:
@@ -130,20 +252,40 @@ def startup_event():
     prompt_builder = ChatPromptBuilder(template=template, required_variables=["question", "documents", "history"])
 
     # 7) Build retrieval-only pipeline (text_embedder -> retriever)
+    # RETRIEVAL_PIPELINE = Pipeline()
+    # RETRIEVAL_PIPELINE.add_component("text_embedder", TEXT_EMBEDDER_RET)
+    # RETRIEVAL_PIPELINE.add_component("retriever", RETRIEVER_RET)
+    # RETRIEVAL_PIPELINE.connect("text_embedder.embedding", "retriever.query_embedding")
+
+    # 7) Build retrieval-only pipeline
     RETRIEVAL_PIPELINE = Pipeline()
     RETRIEVAL_PIPELINE.add_component("text_embedder", TEXT_EMBEDDER_RET)
-    RETRIEVAL_PIPELINE.add_component("retriever", RETRIEVER_RET)
-    RETRIEVAL_PIPELINE.connect("text_embedder.embedding", "retriever.query_embedding")
+    
+    if not PINECONE_INDEX:
+    # Only add retriever to pipeline if using in-memory storage
+        RETRIEVAL_PIPELINE.add_component("retriever", RETRIEVER_RET)
+        RETRIEVAL_PIPELINE.connect("text_embedder.embedding", "retriever.query_embedding")
 
     # 8) Build RAG pipeline (separate instances)
     if CHAT_GENERATOR:
         RAG_PIPELINE = Pipeline()
         RAG_PIPELINE.add_component("text_embedder", TEXT_EMBEDDER_RAG)
-        RAG_PIPELINE.add_component("retriever", RETRIEVER_RAG)
+        # RAG_PIPELINE.add_component("retriever", RETRIEVER_RAG)
         RAG_PIPELINE.add_component("prompt_builder", prompt_builder)
         RAG_PIPELINE.add_component("llm", CHAT_GENERATOR)
-        RAG_PIPELINE.connect("text_embedder.embedding", "retriever.query_embedding")
-        RAG_PIPELINE.connect("retriever", "prompt_builder")
+        # RAG_PIPELINE.connect("text_embedder.embedding", "retriever.query_embedding")
+        # RAG_PIPELINE.connect("retriever", "prompt_builder")
+        # RAG_PIPELINE.connect("prompt_builder.prompt", "llm.messages")
+
+        if not PINECONE_INDEX:
+            # Only add retriever to pipeline if using in-memory storage
+            RAG_PIPELINE.add_component("retriever", RETRIEVER_RAG)
+            RAG_PIPELINE.connect("text_embedder.embedding", "retriever.query_embedding")
+            RAG_PIPELINE.connect("retriever", "prompt_builder")
+        else:
+            # For Pinecone, we'll handle retrieval manually and connect directly to prompt_builder
+            pass
+        
         RAG_PIPELINE.connect("prompt_builder.prompt", "llm.messages")
     else:
         RAG_PIPELINE = None
@@ -204,7 +346,15 @@ async def ingest_file(file: UploadFile = File(...)):
 
         # embed documents (doc embedder) and write to store
         docs_with_embeddings = DOC_EMBEDDER.run(docs)
-        DOCUMENT_STORE.write_documents(docs_with_embeddings["documents"])
+        # DOCUMENT_STORE.write_documents(docs_with_embeddings["documents"])
+        embedded_docs = docs_with_embeddings["documents"]
+
+        # Store in both Pinecone and in-memory (fallback)
+        if PINECONE_INDEX:
+            store_in_pinecone(embedded_docs)
+        
+        # Also store in in-memory for fallback
+        DOCUMENT_STORE.write_documents(embedded_docs)
 
         return {"ok": True, "indexed_chunks": len(docs)}
 
@@ -224,33 +374,89 @@ async def query(req: QueryRequest):
         # get_history_messages returns list of {"role": "...", "content": "..."}
         history_msgs = get_history_messages(session_id, max_messages=12)
 
-        payload = {
-            "text_embedder": {
-                "text": question}, 
+        if PINECONE_INDEX:
+            # Custom pipeline execution for Pinecone
+            # 1. Get query embedding
+            embedding_result = TEXT_EMBEDDER_RAG.run(text=question)
+            query_embedding = embedding_result["embedding"]
+            
+            
+            # 2. Retrieve from Pinecone
+            retrieved_docs = RETRIEVER_RAG.retrieve(query_embedding=query_embedding, top_k=top_k)
+            
+            # 3. Build prompt and get LLM response
+            prompt_result = RAG_PIPELINE.get_component("prompt_builder").run(
+                question=question, 
+                documents=retrieved_docs, 
+                history=history_msgs
+            )
+            
+            llm_result = CHAT_GENERATOR.run(messages=prompt_result["prompt"])
+            
+            try:
+                answer = llm_result["replies"][0].text
+            except Exception as e:
+                print("Exception: ", e)
+                answer = None
+                
+        else:
+            # Original pipeline execution for in-memory
+            payload = {
+                "text_embedder": {"text": question}, 
                 "prompt_builder": {"question": question, "history": history_msgs}
-                }
-        
-        resp = RAG_PIPELINE.run(payload)
-        # The exact shape: resp["llm"]["replies"][0].text
-        try:
-            answer = resp["llm"]["replies"][0].text
-        except Exception:
-            answer = None
-        retrieved = resp.get("retriever", {}).get("documents", [])
+            }
+            
+            resp = RAG_PIPELINE.run(payload)
+            try:
+                answer = resp["llm"]["replies"][0].text
+            except Exception as e:
+                print("Exception: ", e)
+                answer = None
+            retrieved_docs = resp.get("retriever", {}).get("documents", [])
         
         # Persist the current user and assistant messages into session history
         add_to_history(session_id, "user", question)
         if answer:
             add_to_history(session_id, "assistant", answer)
 
-        return {"answer": answer, "retrieved": [{"content": d.content, "meta": d.meta} for d in retrieved]}
+        return {"answer": answer, "retrieved": [{"content": d.content, "meta": d.meta} for d in retrieved_docs]}
     else:
         # retrieval-only
-        print("OpenAI Key Nottt found")
-        resp = RETRIEVAL_PIPELINE.run({"text_embedder": {"text": question}})
-        retrieved = resp.get("retriever", {}).get("documents", [])
-        snippets = [{"content": d.content, "meta": d.meta} for d in retrieved[:top_k]]
+        print("OpenAI Key Not found")
+        # resp = RETRIEVAL_PIPELINE.run({"text_embedder": {"text": question}})
+        # retrieved = resp.get("retriever", {}).get("documents", [])
+        # snippets = [{"content": d.content, "meta": d.meta} for d in retrieved[:top_k]]
+        # return {"answer": None, "retrieved": snippets}
+
+        if PINECONE_INDEX:
+            # Custom retrieval for Pinecone
+            embedding_result = TEXT_EMBEDDER_RET.run(text=question)
+            query_embedding = embedding_result["embedding"]
+            retrieved_docs = RETRIEVER_RET.retrieve(query_embedding=query_embedding, top_k=top_k)
+        else:
+            # Original pipeline execution
+            resp = RETRIEVAL_PIPELINE.run({"text_embedder": {"text": question}})
+            retrieved_docs = resp.get("retriever", {}).get("documents", [])
+        
+        snippets = [{"content": d.content, "meta": d.meta} for d in retrieved_docs[:top_k]]
         return {"answer": None, "retrieved": snippets}
+    
+@app.get("/pinecone/status")
+def pinecone_status():
+    """Check Pinecone connection status"""
+    if PINECONE_INDEX:
+        try:
+            stats = PINECONE_INDEX.describe_index_stats()
+            return {
+                "connected": True,
+                "index_name": PINECONE_INDEX_NAME,
+                "total_vectors": stats.total_vector_count,
+                "dimension": stats.dimension
+            }
+        except Exception as e:
+            return {"connected": False, "error": str(e)}
+    else:
+        return {"connected": False, "message": "Pinecone not configured"}    
 
 @app.get("/health")
 def health():
