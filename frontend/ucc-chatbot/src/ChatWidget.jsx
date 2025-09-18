@@ -18,7 +18,7 @@ function uid(prefix = "id") {
 }
 
 export default function ChatWidget({
-  apiUrl = "http://127.0.0.1:8000/query",
+  apiUrl = "https://chatbot-esiv.onrender.com/query",
   authToken = null,
   initialMessages = [],
   headerTitle = "Chat",
