@@ -2,17 +2,11 @@
 """
 pdf_finder.py
 
-Self-contained scraper:
-- Configure globals below (BASE_URL, API_ENDPOINT, etc.)
-- Run: python pdf_finder.py
+Crawls a site up to TARGET_PAGES pages, finds PDFs, downloads them one-by-one,
+and posts each PDF to an ingest endpoint.
 
 Dependencies:
 pip install requests beautifulsoup4 tqdm
-(or use your environment's package manager)
-
-Notes:
-- This script uses curl for the POST by default (to match your example).
-  Set USE_CURL = False to use Python requests for uploading instead.
 """
 
 import os
@@ -32,11 +26,12 @@ BASE_URL = "https://www.ucc.co.ug/"        # <-- change to your target
 API_ENDPOINT = "http://localhost:8000/ingest"  # <-- change to your ingest endpoint
 DOWNLOAD_DIR = "pdfs"                   # local folder to save PDFs
 CRAWL_DEPTH = 2                         # how deep to crawl (0 = only start page)
-MAX_PAGES = 1000                        # max pages to visit
+MAX_PAGES = 1000                        # safety upper bound to avoid runaway (keeps original)
+TARGET_PAGES = 5                      # <-- NEW: stop after visiting this many pages
 SLEEP_BETWEEN_REQUESTS = 0.2            # polite delay between requests (seconds)
 REQUEST_TIMEOUT = 15                    # seconds for GET/HEAD
 USER_AGENT = "pdf-finder-bot/1.0"       # change if you want
-USE_CURL = False                         # If True, uses curl subprocess to POST file; else uses requests.post
+USE_CURL = False                        # If True, uses curl subprocess to POST file; else uses requests.post
 CSV_SUMMARY = "pdf_results.csv"         # CSV summary output
 # =========================
 
@@ -110,7 +105,6 @@ def ingest_via_curl(local_path, ingest_url):
         proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
         ok = (proc.returncode == 0)
         status_code = None
-        # curl does not provide HTTP code by default; server response_text may include it.
         return {"status": "ok" if ok else "curl_failed", "returncode": proc.returncode, "stdout": proc.stdout.strip(), "stderr": proc.stderr.strip()}
     except Exception as e:
         return {"status": "error", "error": str(e)}
@@ -140,8 +134,13 @@ def crawl_and_process():
     q.append((BASE_URL, 0))
     pages_visited = 0
 
-    while q and pages_visited < MAX_PAGES:
+    while q and pages_visited < min(MAX_PAGES, TARGET_PAGES):
         url, depth = q.popleft()
+        # If we've reached our target pages, break
+        if pages_visited >= TARGET_PAGES:
+            break
+
+        # Skip if already visited
         if url in visited_pages:
             continue
         if depth > CRAWL_DEPTH:
@@ -156,6 +155,7 @@ def crawl_and_process():
             visited_pages.add(url)
             continue
 
+        # Mark as visited (count this page)
         visited_pages.add(url)
         pages_visited += 1
         print(f"[i] Visited ({pages_visited}) {url}  [{status}]")
@@ -195,7 +195,6 @@ def crawl_and_process():
                 continue
 
             # Optional: do HEAD to check content-type for links that don't end with .pdf
-            # Use sparingly because it doubles requests. Enabled here for better detection.
             try:
                 head = requests.head(tgt, allow_redirects=True, timeout=REQUEST_TIMEOUT, headers={"User-Agent": USER_AGENT})
                 head_ct = head.headers.get("Content-Type", "")
@@ -207,7 +206,8 @@ def crawl_and_process():
                 pass
 
             # otherwise enqueue page if not visited and within depth
-            if tgt not in visited_pages and depth + 1 <= CRAWL_DEPTH:
+            if tgt not in visited_pages and depth + 1 <= CRAWL_DEPTH and len(visited_pages) + len(q) < TARGET_PAGES * 2:
+                # small heuristic to avoid endlessly expanding queue:
                 q.append((tgt, depth + 1))
                 pages_queued += 1
 
@@ -219,7 +219,7 @@ def crawl_and_process():
     if not found_pdfs:
         return
 
-    # Progress bar over PDFs
+    # Process PDFs sequentially (resume-safe)
     for pdf_url in tqdm(list(found_pdfs.keys()), desc="Processing PDFs"):
         meta = found_pdfs[pdf_url]
         # skip if already processed (resume-safe)
